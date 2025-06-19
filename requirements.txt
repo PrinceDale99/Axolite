@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+yt-dlp
+ffmpeg-python
+mutagen
+spotipy
+python-dotenv
+requests
+pillow

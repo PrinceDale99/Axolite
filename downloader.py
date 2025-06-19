@@ -32,6 +32,7 @@ def download_audio_task():
 
                 cmd = [
                     "yt-dlp",
+                    "--cookies", "cookies.txt",
                     "-x",
                     f"--audio-format", item['format'],
                     f"--audio-quality", item['quality'],

@@ -1,30 +1,32 @@
-# AXIOLITE: Fast, Private Music Downloader Backend v2
-import os, uuid, json, subprocess, threading, requests
+# AXIOLITE v2 - Clean, Prefixed, and Production-Ready Backend
+import os, uuid, json, subprocess, requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1, ID3NoHeaderError
-from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, ID3NoHeaderError
+from fastapi.routing import APIRouter
 
 # === CONFIG ===
+PREFIX = "/api/v1"
 DOWNLOAD_DIR = "downloads/mp3"
 QUEUE_FILE = "queue.json"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# === INIT ===
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === FASTAPI SETUP ===
+app = FastAPI(title="Axiolite Backend", version="2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+router = APIRouter(prefix=PREFIX)
 
-# === HELPERS ===
+# === MODELS ===
+class DownloadRequest(BaseModel):
+    query: str
+    quality: str = "320"
+
+# === UTILS ===
 def load_queue():
     if os.path.exists(QUEUE_FILE):
-        with open(QUEUE_FILE, "r") as f:
+        with open(QUEUE_FILE) as f:
             return json.load(f)
     return []
 
@@ -32,26 +34,77 @@ def save_queue(data):
     with open(QUEUE_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# === MODELS ===
-class DownloadRequest(BaseModel):
-    query: str
-    quality: str = "320"
+def get_metadata(query):
+    try:
+        result = subprocess.run(["yt-dlp", f"ytsearch1:{query}", "--print-json"], capture_output=True, text=True)
+        j = json.loads(result.stdout.strip().split("\n")[0])
+        return {
+            "title": j.get("title"),
+            "artist": j.get("artist") or j.get("uploader"),
+            "album": j.get("album") or "Single",
+            "thumbnail": j.get("thumbnail"),
+            "video_url": f"https://www.youtube.com/watch?v={j.get('id')}"
+        }
+    except Exception as e:
+        print("[metadata error]", e)
+        return {}
+
+def embed_metadata(file_path, meta):
+    try:
+        try:
+            tags = ID3(file_path)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        tags.add(TIT2(encoding=3, text=meta["title"]))
+        tags.add(TPE1(encoding=3, text=meta["artist"]))
+        tags.add(TALB(encoding=3, text=meta["album"]))
+
+        img = requests.get(meta["thumbnail"], timeout=10).content
+        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img))
+        tags.save(file_path)
+    except Exception as e:
+        print("[tag error]", e)
+
+def run_download(job_id, url, quality, file_path, meta):
+    queue = load_queue()
+    item = next((i for i in queue if i["id"] == job_id), None)
+    if not item:
+        return
+
+    try:
+        item["status"] = "downloading"
+        save_queue(queue)
+
+        tmp = file_path.replace(".mp3", ".webm")
+        subprocess.run([
+            "yt-dlp", "-f", "bestaudio", "--extract-audio",
+            "--audio-format", "mp3", "--audio-quality", quality,
+            "-o", tmp, url
+        ], check=True)
+
+        if os.path.exists(tmp):
+            os.rename(tmp, file_path)
+            embed_metadata(file_path, meta)
+            item["status"] = "completed"
+        else:
+            item["status"] = "failed"
+    except Exception as e:
+        print("[dl error]", e)
+        item["status"] = "failed"
+    finally:
+        save_queue(queue)
 
 # === ROUTES ===
-@app.post("/download-audio")
-async def download_audio(req: DownloadRequest, background_tasks: BackgroundTasks):
-    job_id = str(uuid.uuid4())
-    queue = load_queue()
-
-    # Fetch metadata & yt URL
+@router.post("/downloads/audio")
+def queue_download(req: DownloadRequest, background_tasks: BackgroundTasks):
     meta = get_metadata(req.query)
     if not meta or not meta.get("video_url"):
-        raise HTTPException(404, "No track found")
+        raise HTTPException(404, "Track not found")
 
-    file_name = f"{job_id}.mp3"
-    file_path = os.path.join(DOWNLOAD_DIR, file_name)
-
-    # Append to queue
+    job_id = str(uuid.uuid4())
+    file_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
+    queue = load_queue()
     queue.append({
         "id": job_id,
         "status": "queued",
@@ -62,97 +115,20 @@ async def download_audio(req: DownloadRequest, background_tasks: BackgroundTasks
         "file_path": file_path
     })
     save_queue(queue)
-
     background_tasks.add_task(run_download, job_id, meta["video_url"], req.quality, file_path, meta)
     return {"id": job_id}
 
-@app.get("/download-queue")
-async def get_queue():
+@router.get("/downloads/queue")
+def get_queue():
     return load_queue()
 
-@app.get("/download-file/{item_id}")
-async def download_file(item_id: str):
+@router.get("/downloads/file/{item_id}")
+def serve_file(item_id: str):
     queue = load_queue()
-    for item in queue:
-        if item["id"] == item_id and item["status"] == "completed":
-            return FileResponse(item["file_path"], filename=f"{item['title']} - {item['artist']}.mp3")
-    raise HTTPException(404, "Not ready yet")
+    item = next((i for i in queue if i["id"] == item_id), None)
+    if not item or item["status"] != "completed":
+        raise HTTPException(404, "File not found")
+    return FileResponse(item["file_path"], filename=f"{item['title']} - {item['artist']}.mp3")
 
-# === CORE: Metadata Search ===
-def get_metadata(query):
-    try:
-        cmd = ["yt-dlp", f"ytsearch1:{query}", "--print-json"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        j = json.loads(res.stdout.strip().split('\n')[0])
-        return {
-            "title": j.get("title"),
-            "artist": j.get("artist") or j.get("uploader"),
-            "album": j.get("album") or "Single",
-            "thumbnail": j.get("thumbnail"),
-            "video_url": f"https://www.youtube.com/watch?v={j.get('id')}"
-        }
-    except Exception as e:
-        print("Metadata error:", e)
-        return {}
-
-# === CORE: Download + Tag ===
-def run_download(job_id, url, quality, file_path, meta):
-    queue = load_queue()
-    item = next((x for x in queue if x["id"] == job_id), None)
-    if not item:
-        return
-
-    try:
-        item["status"] = "downloading"
-        save_queue(queue)
-
-        # temp path
-        tmp = file_path.replace(".mp3", ".webm")
-
-        cmd = [
-            "yt-dlp",
-            "-f", "bestaudio",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", quality,
-            "-o", tmp,
-            url
-        ]
-        subprocess.run(cmd, check=True)
-
-        if os.path.exists(tmp):
-            os.rename(tmp, file_path)
-
-        embed_tags(file_path, meta)
-        item["status"] = "completed"
-    except Exception as e:
-        print("DL error:", e)
-        item["status"] = "failed"
-    finally:
-        save_queue(queue)
-
-# === TAGGING ===
-def embed_tags(mp3_file, meta):
-    try:
-        audio = ID3(mp3_file)
-    except ID3NoHeaderError:
-        audio = ID3()
-
-    audio.add(TIT2(encoding=3, text=meta["title"]))
-    audio.add(TPE1(encoding=3, text=meta["artist"]))
-    audio.add(TALB(encoding=3, text=meta["album"]))
-
-    # Album Art
-    try:
-        img_data = requests.get(meta["thumbnail"], timeout=10).content
-        audio.add(APIC(
-            encoding=3,
-            mime="image/jpeg",
-            type=3,
-            desc=u"Cover",
-            data=img_data
-        ))
-    except Exception as e:
-        print("Art error:", e)
-
-    audio.save(mp3_file)
+# === REGISTER ROUTER ===
+app.include_router(router)
